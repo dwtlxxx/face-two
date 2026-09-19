@@ -48,6 +48,22 @@ function Write-Log {
     Write-Host $line
 }
 
+# 捕获 git 输出到文件再读取，避免 PowerShell 把 git 写在 stderr 的正常信息
+# （例如 "Everything up-to-date"）包装成 NativeCommandError 异常而误判为失败。
+function Invoke-Git {
+    param([string[]]$Arguments)
+    $tmp = Join-Path $env:TEMP ("gitout_{0}_{1}.txt" -f $PID, [guid]::NewGuid().ToString('N').Substring(0, 8))
+    try {
+        & $git @Arguments *> $tmp
+        $code = $LASTEXITCODE
+        $text = if (Test-Path -LiteralPath $tmp) { (Get-Content -LiteralPath $tmp -Raw) } else { '' }
+        return [pscustomobject]@{ Code = $code; Output = ($text -as [string]) }
+    }
+    finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # 日志轮转：超过 256KB 就保留最后 500 行，防止无限增长
 try {
     if ((Test-Path -LiteralPath $LogFile) -and (Get-Item -LiteralPath $LogFile).Length -gt 256KB) {
@@ -91,7 +107,11 @@ try {
     $env:GIT_TERMINAL_PROMPT = '0'
 
     if (-not (Test-Path -LiteralPath (Join-Path $RepoPath '.git'))) {
-        Write-Log "目标不是 git 仓库：$RepoPath" 'ERROR'; exit 1
+        # bare 仓库和 worktree 没有 .git 目录，用 rev-parse 复核，不能只靠 Test-Path
+        $null = Invoke-Git -Arguments @('-C', $RepoPath, 'rev-parse', '--git-dir')
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "目标不是 git 仓库：$RepoPath" 'ERROR'; exit 1
+        }
     }
 
     # ---------- 确认是当前分支 ----------
@@ -126,15 +146,14 @@ try {
 
     # ---------- 推送 ----------
     # 先 fetch，避免远程有新提交导致 non-fast-forward 被拒
-    & $git -C $RepoPath fetch --quiet $Remote 2>&1 | Out-Null
+    Invoke-Git -Arguments @('-C', $RepoPath, 'fetch', '--quiet', $Remote) | Out-Null
 
-    $out = & $git -C $RepoPath push $Remote "refs/heads/$Branch`:refs/heads/$Branch" 2>&1 | Out-String
-    $code = $LASTEXITCODE
+    $r = Invoke-Git -Arguments @('-C', $RepoPath, 'push', $Remote, "refs/heads/$Branch`:refs/heads/$Branch")
 
-    if ($code -eq 0) {
+    if ($r.Code -eq 0) {
         Write-Log "推送成功：$ahead 个提交已上传到 $Remote/$Branch。"
     } else {
-        Write-Log "推送失败（exit=$code）：$($out.Trim())" 'ERROR'
+        Write-Log "推送失败（exit=$($r.Code)）：$($r.Output.Trim())" 'ERROR'
         exit 1
     }
 }
