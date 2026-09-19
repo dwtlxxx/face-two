@@ -9,6 +9,10 @@ Desktop.ini
 !.vscode/settings.json
 !.vscode/extensions.json
 
+# ===== Local workstation config (machine-specific, never commit) =====
+.git-local/
+*.local.crt
+
 # ===== Secrets (never commit) =====
 .env
 .env.*
