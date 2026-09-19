@@ -28,7 +28,9 @@ param(
     [string]$LogFile
 )
 
-$ErrorActionPreference = 'Stop'
+# 注意：这里刻意不用 'Stop'。git 会把正常进度信息写到 stderr，在 'Stop' 下会变成
+# 致命错误，导致明明推送成功却被记为失败。错误处理改为显式检查退出码与远程引用。
+$ErrorActionPreference = 'Continue'
 
 # ---------- 解析路径 ----------
 if (-not $RepoPath) {
@@ -53,6 +55,11 @@ function Write-Log {
 function Invoke-Git {
     param([string[]]$Arguments)
     $tmp = Join-Path $env:TEMP ("gitout_{0}_{1}.txt" -f $PID, [guid]::NewGuid().ToString('N').Substring(0, 8))
+    # git 把正常进度信息写到 stderr（例如 "To https://..."、"Everything up-to-date"），
+    # 在 $ErrorActionPreference='Stop' 下会被当成致命错误。这里临时降级为 Continue，
+    # 退出码仍通过 $LASTEXITCODE 取，不受影响。
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
         & $git @Arguments *> $tmp
         $code = $LASTEXITCODE
@@ -60,6 +67,7 @@ function Invoke-Git {
         return [pscustomobject]@{ Code = $code; Output = ($text -as [string]) }
     }
     finally {
+        $ErrorActionPreference = $prevEap
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
 }
@@ -150,10 +158,18 @@ try {
 
     $r = Invoke-Git -Arguments @('-C', $RepoPath, 'push', $Remote, "refs/heads/$Branch`:refs/heads/$Branch")
 
-    if ($r.Code -eq 0) {
-        Write-Log "推送成功：$ahead 个提交已上传到 $Remote/$Branch。"
+    # 判定成功不能只看退出码或输出文字：git 会把 "To https://..." 这类正常
+    # 进度信息写到 stderr，容易被误判成失败。这里直接用「本地 HEAD 与远程
+    # 引用是否一致」这个客观事实来确认。
+    $localSha = ((Invoke-Git -Arguments @('-C', $RepoPath, 'rev-parse', $Branch)).Output).Trim()
+    $refOut   = (Invoke-Git -Arguments @('-C', $RepoPath, 'ls-remote', '--heads', $Remote, $Branch)).Output
+    $remoteSha = ''
+    if ($refOut -match '(?m)^([0-9a-f]{40})\s') { $remoteSha = $Matches[1] }
+
+    if ($r.Code -eq 0 -and $localSha -and $localSha -eq $remoteSha) {
+        Write-Log "推送成功：$ahead 个提交已上传（$($localSha.Substring(0,7))）。"
     } else {
-        Write-Log "推送失败（exit=$($r.Code)）：$($r.Output.Trim())" 'ERROR'
+        Write-Log "推送失败（exit=$($r.Code)，本地=$($localSha.Substring(0,7))，远程=$(if($remoteSha){$remoteSha.Substring(0,7)}else{'未知'})）：$($r.Output.Trim())" 'ERROR'
         exit 1
     }
 }
